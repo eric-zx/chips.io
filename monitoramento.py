@@ -305,6 +305,49 @@ class Database:
         conn.close()
         return resultados
     
+    def buscar_chips_remessa(self, remessa_id: int):
+        """Busca todos os chips de uma remessa"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, iccid, operadora, status, data_entrada, data_saida, retirado_por
+            FROM chips
+            WHERE remessa_id = ?
+            ORDER BY data_entrada
+        ''', (remessa_id,))
+        resultados = cursor.fetchall()
+        conn.close()
+        return resultados
+    
+    def buscar_remessa_por_id(self, remessa_id: int):
+        """Busca informações de uma remessa pelo ID"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, numero_remessa, data_remessa, operadora, quantidade, observacoes FROM remessas WHERE id = ?', (remessa_id,))
+        resultado = cursor.fetchone()
+        conn.close()
+        return resultado
+    
+    def excluir_remessa(self, remessa_id: int, excluir_chips: bool = False):
+        """Exclui uma remessa e opcionalmente os chips relacionados"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            if excluir_chips:
+                # Excluir chips primeiro
+                cursor.execute('DELETE FROM chips WHERE remessa_id = ?', (remessa_id,))
+            
+            # Excluir remessa
+            cursor.execute('DELETE FROM remessas WHERE id = ?', (remessa_id,))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            return False
+    
     def estatisticas(self):
         """Retorna estatísticas do sistema"""
         conn = self.get_connection()
@@ -535,11 +578,13 @@ class MonitoramentoApp:
         
         tk.Label(chips_inner, text="📝 Lista de Chips (ICCID, Operadora)", 
                 font=('Segoe UI', 14, 'bold'), bg=COR_CARD, fg=COR_TEXTO).pack(pady=(20, 10), anchor=tk.W, padx=20)
-        texto_formato = "Formato: ICCID,Operadora (um por linha) ou importe CSV/XLSX"
+        texto_formato = "Formato: ICCID,Operadora (um por linha) ou apenas ICCID (usará operadora da remessa)"
+        texto_formato += "\nImporte CSV/XLSX: Coluna A = ICCID, Coluna B = Operadora (opcional)"
         if not XLSX_AVAILABLE:
-            texto_formato += " (instale openpyxl para suporte XLSX)"
+            texto_formato += " | Instale openpyxl para suporte XLSX: pip install openpyxl"
         tk.Label(chips_inner, text=texto_formato, 
-                font=('Segoe UI', 9), bg=COR_CARD, fg=COR_TEXTO_SECUNDARIO).pack(anchor=tk.W, padx=20, pady=(0, 10))
+                font=('Segoe UI', 9), bg=COR_CARD, fg=COR_TEXTO_SECUNDARIO, 
+                justify=tk.LEFT).pack(anchor=tk.W, padx=20, pady=(0, 10))
         
         chips_text_frame = tk.Frame(chips_inner, bg=COR_CARD)
         chips_text_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 15))
@@ -736,10 +781,23 @@ class MonitoramentoApp:
         tk.Label(title_frame, text="📋 Histórico de Remessas", 
                 font=('Segoe UI', 16, 'bold'), bg=COR_CARD, fg=COR_TEXTO).pack(side=tk.LEFT)
         
-        btn_atualizar = ModernButton(title_frame, "🔄 Atualizar", self.atualizar_remessas,
+        btn_frame = tk.Frame(title_frame, bg=COR_CARD)
+        btn_frame.pack(side=tk.RIGHT)
+        
+        btn_visualizar = ModernButton(btn_frame, "👁️ Visualizar", self.visualizar_remessa,
+                                     width=130, height=35, bg_color=COR_ACCENT, hover_color='#0891b2',
+                                     font=('Segoe UI', 10, 'bold'))
+        btn_visualizar.pack(side=tk.LEFT, padx=5)
+        
+        btn_excluir = ModernButton(btn_frame, "🗑️ Excluir", self.excluir_remessa_selecionada,
+                                   width=130, height=35, bg_color=COR_ERRO, hover_color='#dc2626',
+                                   font=('Segoe UI', 10, 'bold'))
+        btn_excluir.pack(side=tk.LEFT, padx=5)
+        
+        btn_atualizar = ModernButton(btn_frame, "🔄 Atualizar", self.atualizar_remessas,
                                      width=130, height=35, bg_color=COR_PRIMARIA, hover_color=COR_SECUNDARIA,
                                      font=('Segoe UI', 10, 'bold'))
-        btn_atualizar.pack(side=tk.RIGHT, padx=(10, 0))
+        btn_atualizar.pack(side=tk.LEFT, padx=5)
         
         # Treeview
         tree_frame = tk.Frame(inner, bg=COR_CARD)
@@ -759,6 +817,9 @@ class MonitoramentoApp:
         
         self.remessas_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Bind duplo clique para visualizar
+        self.remessas_tree.bind('<Double-1>', lambda e: self.visualizar_remessa())
         
         self.atualizar_remessas()
     
@@ -888,22 +949,40 @@ class MonitoramentoApp:
                 ws = wb.active
                 
                 for row in ws.iter_rows(min_row=1, values_only=True):
-                    if row and len(row) >= 2 and row[0] and row[1]:
-                        # Remover espaços e verificar se não é cabeçalho
+                    if row and row[0]:
                         iccid = str(row[0]).strip()
-                        operadora = str(row[1]).strip()
-                        if iccid.lower() != 'iccid' and operadora.lower() != 'operadora':
-                            linhas.append(f"{iccid},{operadora}")
+                        # Pular cabeçalho
+                        if iccid.lower() in ['iccid', 'iccid ']:
+                            continue
+                        # Verificar se tem operadora na coluna B
+                        if len(row) >= 2 and row[1]:
+                            operadora = str(row[1]).strip()
+                            if operadora.lower() not in ['operadora', 'operadora '] and operadora:
+                                linhas.append(f"{iccid},{operadora}")
+                            elif iccid:  # Apenas ICCID, sem operadora
+                                linhas.append(f"{iccid},")
+                        elif iccid:  # Apenas ICCID, sem coluna B
+                            linhas.append(f"{iccid},")
             
             else:
                 # Importar CSV
                 with open(arquivo, 'r', encoding='utf-8') as f:
                     reader = csv.reader(f)
                     for row in reader:
-                        if len(row) >= 2 and row[0].strip() and row[1].strip():
-                            # Pular cabeçalho se existir
-                            if row[0].lower() != 'iccid' and row[1].lower() != 'operadora':
-                                linhas.append(f"{row[0].strip()},{row[1].strip()}")
+                        if row and len(row) > 0 and row[0].strip():
+                            iccid = row[0].strip()
+                            # Pular cabeçalho
+                            if iccid.lower() in ['iccid', 'iccid ']:
+                                continue
+                            # Verificar se tem operadora na coluna B
+                            if len(row) >= 2 and row[1].strip():
+                                operadora = row[1].strip()
+                                if operadora.lower() not in ['operadora', 'operadora '] and operadora:
+                                    linhas.append(f"{iccid},{operadora}")
+                                else:
+                                    linhas.append(f"{iccid},")
+                            else:  # Apenas ICCID
+                                linhas.append(f"{iccid},")
             
             if linhas:
                 self.chips_text.insert('1.0', '\n'.join(linhas))
@@ -935,17 +1014,31 @@ class MonitoramentoApp:
         # Processar chips
         linhas = [linha.strip() for linha in chips_text.split('\n') if linha.strip()]
         chips = []
+        operadora_padrao = operadora_remessa if operadora_remessa in OPERADORAS else None
         
         for linha in linhas:
             partes = [p.strip() for p in linha.split(',')]
-            if len(partes) >= 2:
+            if len(partes) >= 1 and partes[0]:  # Pelo menos tem ICCID
                 iccid = partes[0]
-                operadora = partes[1]
-                if operadora in OPERADORAS:
+                
+                # Se tem operadora na linha, usar ela
+                if len(partes) >= 2 and partes[1] and partes[1] in OPERADORAS:
+                    operadora = partes[1]
                     chips.append((iccid, operadora))
+                # Se não tem operadora na linha, usar a operadora da remessa
+                elif operadora_padrao:
+                    chips.append((iccid, operadora_padrao))
+                # Se não tem operadora nem na linha nem na remessa, ignorar
+                else:
+                    continue
         
         if not chips:
-            messagebox.showerror("Erro", "Nenhum chip válido encontrado!")
+            if not operadora_padrao:
+                messagebox.showerror("Erro", 
+                    "Nenhum chip válido encontrado!\n\n"
+                    "Se os chips não tiverem operadora, selecione uma operadora na remessa.")
+            else:
+                messagebox.showerror("Erro", "Nenhum chip válido encontrado!")
             return
         
         # Criar remessa com número gerado automaticamente
@@ -963,7 +1056,6 @@ class MonitoramentoApp:
         if falhas:
             mensagem += f"\n⚠ {len(falhas)} chips já existentes"
         
-        messagebox.showinfo("Resultado", mensagem)
         self.lote_status_label.config(text=mensagem, foreground=COR_SUCESSO)
         self.limpar_lote()
         # Gerar novo número para próxima remessa
@@ -1008,16 +1100,15 @@ class MonitoramentoApp:
             return
         
         if self.db.retirar_chip(iccid, retirado_por):
-            messagebox.showinfo("Sucesso", f"✓ Chip {iccid} retirado com sucesso por {retirado_por}!")
-            self.retirada_status_label.config(text="✓ Retirada realizada com sucesso!", foreground=COR_SUCESSO)
+            self.retirada_status_label.config(text=f"✓ Chip {iccid} retirado com sucesso por {retirado_por}!", foreground=COR_SUCESSO)
             self.retirada_iccid_entry.delete(0, tk.END)
             self.retirado_por_entry.delete(0, tk.END)
             self.chip_info_label.config(text="Digite o ICCID para buscar informações", 
                                        foreground=COR_TEXTO_SECUNDARIO)
-            self.root.after(3000, lambda: self.retirada_status_label.config(text=""))
+            self.root.after(5000, lambda: self.retirada_status_label.config(text=""))
         else:
-            messagebox.showerror("Erro", f"❌ Chip {iccid} não encontrado ou já foi retirado!")
-            self.retirada_status_label.config(text="❌ Erro na retirada!", foreground=COR_ERRO)
+            self.retirada_status_label.config(text=f"❌ Chip {iccid} não encontrado ou já foi retirado!", foreground=COR_ERRO)
+            self.root.after(5000, lambda: self.retirada_status_label.config(text=""))
     
     def atualizar_consulta(self):
         """Atualiza a lista de chips"""
@@ -1084,7 +1175,154 @@ class MonitoramentoApp:
                 operadora or '',
                 quantidade,
                 obs or ''
+            ), tags=(id_rem,))
+    
+    def visualizar_remessa(self):
+        """Visualiza os chips de uma remessa selecionada"""
+        selecionado = self.remessas_tree.selection()
+        if not selecionado:
+            messagebox.showwarning("Aviso", "Selecione uma remessa para visualizar!")
+            return
+        
+        item = selecionado[0]
+        values = self.remessas_tree.item(item, 'values')
+        if not values:
+            return
+        
+        remessa_id = int(values[0])
+        
+        # Buscar informações da remessa
+        remessa_info = self.db.buscar_remessa_por_id(remessa_id)
+        if not remessa_info:
+            messagebox.showerror("Erro", "Remessa não encontrada!")
+            return
+        
+        _, num_rem, data_rem, operadora, quantidade, obs = remessa_info
+        
+        # Buscar chips da remessa
+        chips = self.db.buscar_chips_remessa(remessa_id)
+        
+        # Criar janela de visualização
+        janela = tk.Toplevel(self.root)
+        janela.title(f"Visualizar Remessa: {num_rem}")
+        janela.geometry("900x650")
+        janela.configure(bg=COR_FUNDO)
+        janela.transient(self.root)
+        janela.grab_set()
+        
+        # Header
+        header = tk.Frame(janela, bg=COR_PRIMARIA, height=80)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        
+        info_frame = tk.Frame(header, bg=COR_PRIMARIA)
+        info_frame.pack(padx=20, pady=15)
+        
+        tk.Label(info_frame, text=f"📦 Remessa: {num_rem}", 
+                font=('Segoe UI', 16, 'bold'), bg=COR_PRIMARIA, fg='white').pack(anchor=tk.W)
+        tk.Label(info_frame, text=f"Data: {data_rem} | Operadora: {operadora or 'N/A'} | Quantidade: {quantidade}", 
+                font=('Segoe UI', 10), bg=COR_PRIMARIA, fg='#c7d2fe').pack(anchor=tk.W, pady=(5, 0))
+        if obs:
+            tk.Label(info_frame, text=f"Observações: {obs}", 
+                    font=('Segoe UI', 9), bg=COR_PRIMARIA, fg='#c7d2fe').pack(anchor=tk.W, pady=(2, 0))
+        
+        # Container principal
+        main_frame = tk.Frame(janela, bg=COR_FUNDO)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Card
+        card = CardFrame(main_frame, bg=COR_CARD)
+        card.pack(fill=tk.BOTH, expand=True)
+        
+        inner = card.inner_frame
+        
+        tk.Label(inner, text=f"📱 Chips da Remessa ({len(chips)} chips)", 
+                font=('Segoe UI', 14, 'bold'), bg=COR_CARD, fg=COR_TEXTO).pack(pady=(20, 15), padx=20, anchor=tk.W)
+        
+        # Treeview
+        tree_frame = tk.Frame(inner, bg=COR_CARD)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 20))
+        
+        columns = ('ICCID', 'Operadora', 'Status', 'Data Entrada', 'Data Saída', 'Retirado Por')
+        tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=20, style='Modern.Treeview')
+        
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=140, anchor=tk.CENTER)
+        
+        tree.column('ICCID', width=180)
+        
+        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Popular treeview
+        for chip in chips:
+            _, iccid, operadora_chip, status, data_entrada, data_saida, retirado_por = chip
+            tree.insert('', tk.END, values=(
+                iccid,
+                operadora_chip,
+                status,
+                data_entrada,
+                data_saida or '',
+                retirado_por or ''
             ))
+        
+        # Botão fechar
+        btn_frame = tk.Frame(inner, bg=COR_CARD)
+        btn_frame.pack(pady=(0, 20))
+        
+        btn_fechar = ModernButton(btn_frame, "✕ Fechar", janela.destroy,
+                                  width=150, height=40, bg_color=COR_TEXTO_SECUNDARIO, 
+                                  hover_color='#475569', font=('Segoe UI', 10, 'bold'))
+        btn_fechar.pack()
+    
+    def excluir_remessa_selecionada(self):
+        """Exclui a remessa selecionada"""
+        selecionado = self.remessas_tree.selection()
+        if not selecionado:
+            messagebox.showwarning("Aviso", "Selecione uma remessa para excluir!")
+            return
+        
+        item = selecionado[0]
+        values = self.remessas_tree.item(item, 'values')
+        if not values:
+            return
+        
+        remessa_id = int(values[0])
+        num_rem = values[1]
+        
+        # Confirmar exclusão
+        resposta = messagebox.askyesno(
+            "Confirmar Exclusão",
+            f"Deseja realmente excluir a remessa {num_rem}?",
+            icon='warning'
+        )
+        
+        if not resposta:
+            return
+        
+        # Perguntar se deseja excluir chips também
+        excluir_chips = messagebox.askyesno(
+            "Excluir Chips",
+            "Deseja excluir também os chips relacionados a esta remessa?\n\n"
+            "SIM = Exclui remessa e todos os chips\n"
+            "NÃO = Exclui apenas a remessa (chips permanecem no sistema)"
+        )
+        
+        # Executar exclusão
+        sucesso = self.db.excluir_remessa(remessa_id, excluir_chips)
+        
+        if sucesso:
+            if excluir_chips:
+                messagebox.showinfo("Sucesso", f"Remessa {num_rem} e seus chips foram excluídos com sucesso!")
+            else:
+                messagebox.showinfo("Sucesso", f"Remessa {num_rem} foi excluída. Os chips permanecem no sistema.")
+            self.atualizar_remessas()
+        else:
+            messagebox.showerror("Erro", "Erro ao excluir remessa!")
     
     def atualizar_estatisticas(self):
         """Atualiza as estatísticas com animação"""
